@@ -75,7 +75,7 @@ func ExampleDecrypt() {
 }
 
 func ExampleParseIdentities() {
-	keyFile, err := os.Open("testdata/keys.txt")
+	keyFile, err := os.Open("testdata/example_keys.txt")
 	if err != nil {
 		log.Fatalf("Failed to open private keys file: %v", err)
 	}
@@ -218,5 +218,69 @@ AGE-SECRET-KEY--1D6K0SGAX3NU66R4GYFZY0UQWCLM3UUSF3CXLW4KXZM342WQSJ82QKU59Q`},
 				t.Errorf("ParseIdentities() returned %d identities, want %d", len(got), tt.wantCount)
 			}
 		})
+	}
+}
+
+type testRecipient struct {
+	labels []string
+}
+
+func (testRecipient) Wrap(fileKey []byte) ([]*age.Stanza, error) {
+	panic("expected WrapWithLabels instead")
+}
+
+func (t testRecipient) WrapWithLabels(fileKey []byte) (s []*age.Stanza, labels []string, err error) {
+	return []*age.Stanza{{Type: "test"}}, t.labels, nil
+}
+
+func TestLabels(t *testing.T) {
+	scrypt, err := age.NewScryptRecipient("xxx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	i, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	x25519 := i.Recipient()
+	pqc := testRecipient{[]string{"postquantum"}}
+	pqcAndFoo := testRecipient{[]string{"postquantum", "foo"}}
+	fooAndPQC := testRecipient{[]string{"foo", "postquantum"}}
+
+	if _, err := age.Encrypt(io.Discard, scrypt, scrypt); err == nil {
+		t.Error("expected two scrypt recipients to fail")
+	}
+	if _, err := age.Encrypt(io.Discard, scrypt, x25519); err == nil {
+		t.Error("expected x25519 mixed with scrypt to fail")
+	}
+	if _, err := age.Encrypt(io.Discard, x25519, scrypt); err == nil {
+		t.Error("expected x25519 mixed with scrypt to fail")
+	}
+	if _, err := age.Encrypt(io.Discard, pqc, x25519); err == nil {
+		t.Error("expected x25519 mixed with pqc to fail")
+	}
+	if _, err := age.Encrypt(io.Discard, x25519, pqc); err == nil {
+		t.Error("expected x25519 mixed with pqc to fail")
+	}
+	if _, err := age.Encrypt(io.Discard, pqc, pqc); err != nil {
+		t.Errorf("expected two pqc to work, got %v", err)
+	}
+	if _, err := age.Encrypt(io.Discard, pqc); err != nil {
+		t.Errorf("expected one pqc to work, got %v", err)
+	}
+	if _, err := age.Encrypt(io.Discard, pqcAndFoo, pqc); err == nil {
+		t.Error("expected pqc+foo mixed with pqc to fail")
+	}
+	if _, err := age.Encrypt(io.Discard, pqc, pqcAndFoo); err == nil {
+		t.Error("expected pqc+foo mixed with pqc to fail")
+	}
+	if _, err := age.Encrypt(io.Discard, pqc, pqc, pqcAndFoo); err == nil {
+		t.Error("expected pqc+foo mixed with pqc to fail")
+	}
+	if _, err := age.Encrypt(io.Discard, pqcAndFoo, pqcAndFoo); err != nil {
+		t.Errorf("expected two pqc+foo to work, got %v", err)
+	}
+	if _, err := age.Encrypt(io.Discard, pqcAndFoo, fooAndPQC); err != nil {
+		t.Errorf("expected pqc+foo mixed with foo+pqc to work, got %v", err)
 	}
 }

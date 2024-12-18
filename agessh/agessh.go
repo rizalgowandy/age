@@ -103,7 +103,7 @@ func NewRSAIdentity(key *rsa.PrivateKey) (*RSAIdentity, error) {
 	return i, nil
 }
 
-func (i *RSAIdentity) Recipient() age.Recipient {
+func (i *RSAIdentity) Recipient() *RSARecipient {
 	return &RSARecipient{
 		sshKey: i.sshKey,
 		pubKey: &i.k.PublicKey,
@@ -274,6 +274,9 @@ func ParseIdentity(pemBytes []byte) (age.Identity, error) {
 	switch k := k.(type) {
 	case *ed25519.PrivateKey:
 		return NewEd25519Identity(*k)
+	// ParseRawPrivateKey returns inconsistent types. See Issue 429.
+	case ed25519.PrivateKey:
+		return NewEd25519Identity(k)
 	case *rsa.PrivateKey:
 		return NewRSAIdentity(k)
 	}
@@ -288,7 +291,7 @@ func ed25519PrivateKeyToCurve25519(pk ed25519.PrivateKey) []byte {
 	return out[:curve25519.ScalarSize]
 }
 
-func (i *Ed25519Identity) Recipient() age.Recipient {
+func (i *Ed25519Identity) Recipient() *Ed25519Recipient {
 	return &Ed25519Recipient{
 		sshKey:         i.sshKey,
 		theirPublicKey: i.ourPublicKey,

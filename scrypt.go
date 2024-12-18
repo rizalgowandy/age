@@ -6,8 +6,10 @@ package age
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 
 	"filippo.io/age/internal/format"
@@ -86,6 +88,29 @@ func (r *ScryptRecipient) Wrap(fileKey []byte) ([]*Stanza, error) {
 	return []*Stanza{l}, nil
 }
 
+// WrapWithLabels implements [age.RecipientWithLabels], returning a random
+// label. This ensures a ScryptRecipient can't be mixed with other recipients
+// (including other ScryptRecipients).
+//
+// Users reasonably expect files encrypted to a passphrase to be [authenticated]
+// by that passphrase, i.e. for it to be impossible to produce a file that
+// decrypts successfully with a passphrase without knowing it. If a file is
+// encrypted to other recipients, those parties can produce different files that
+// would break that expectation.
+//
+// [authenticated]: https://words.filippo.io/dispatches/age-authentication/
+func (r *ScryptRecipient) WrapWithLabels(fileKey []byte) (stanzas []*Stanza, labels []string, err error) {
+	stanzas, err = r.Wrap(fileKey)
+
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return nil, nil, err
+	}
+	labels = []string{hex.EncodeToString(random)}
+
+	return
+}
+
 // ScryptIdentity is a password-based identity.
 type ScryptIdentity struct {
 	password      []byte
@@ -128,6 +153,8 @@ func (i *ScryptIdentity) Unwrap(stanzas []*Stanza) ([]byte, error) {
 	return multiUnwrap(i.unwrap, stanzas)
 }
 
+var digitsRe = regexp.MustCompile(`^[1-9][0-9]*$`)
+
 func (i *ScryptIdentity) unwrap(block *Stanza) ([]byte, error) {
 	if block.Type != "scrypt" {
 		return nil, ErrIncorrectIdentity
@@ -142,6 +169,9 @@ func (i *ScryptIdentity) unwrap(block *Stanza) ([]byte, error) {
 	if len(salt) != scryptSaltSize {
 		return nil, errors.New("invalid scrypt recipient block")
 	}
+	if w := block.Args[1]; !digitsRe.MatchString(w) {
+		return nil, fmt.Errorf("scrypt work factor encoding invalid: %q", w)
+	}
 	logN, err := strconv.Atoi(block.Args[1])
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse scrypt work factor: %v", err)
@@ -149,13 +179,13 @@ func (i *ScryptIdentity) unwrap(block *Stanza) ([]byte, error) {
 	if logN > i.maxWorkFactor {
 		return nil, fmt.Errorf("scrypt work factor too large: %v", logN)
 	}
-	if logN <= 0 {
+	if logN <= 0 { // unreachable
 		return nil, fmt.Errorf("invalid scrypt work factor: %v", logN)
 	}
 
 	salt = append([]byte(scryptLabel), salt...)
 	k, err := scrypt.Key(i.password, salt, 1<<logN, 8, 1, chacha20poly1305.KeySize)
-	if err != nil {
+	if err != nil { // unreachable
 		return nil, fmt.Errorf("failed to generate scrypt hash: %v", err)
 	}
 

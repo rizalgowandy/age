@@ -10,25 +10,18 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"os"
+	"path/filepath"
+	"regexp"
 	"runtime/debug"
 	"strings"
 
 	"filippo.io/age"
 	"filippo.io/age/agessh"
 	"filippo.io/age/armor"
+	"filippo.io/age/plugin"
 	"golang.org/x/term"
 )
-
-type multiFlag []string
-
-func (f *multiFlag) String() string { return fmt.Sprint(*f) }
-
-func (f *multiFlag) Set(value string) error {
-	*f = append(*f, value)
-	return nil
-}
 
 const usage = `Usage:
     age [--encrypt] (-r RECIPIENT | -R PATH)... [--armor] [-o OUTPUT] [INPUT]
@@ -75,21 +68,52 @@ Example:
 // golang.org/issue/29814 and golang.org/issue/29228.
 var Version string
 
+// stdinInUse is used to ensure only one of input, recipients, or identities
+// file is read from stdin. It's a singleton like os.Stdin.
+var stdinInUse bool
+
+type multiFlag []string
+
+func (f *multiFlag) String() string { return fmt.Sprint(*f) }
+
+func (f *multiFlag) Set(value string) error {
+	*f = append(*f, value)
+	return nil
+}
+
+type identityFlag struct {
+	Type, Value string
+}
+
+// identityFlags tracks -i and -j flags, preserving their relative order, so
+// that "age -d -j agent -i encrypted-fallback-keys.age" behaves as expected.
+type identityFlags []identityFlag
+
+func (f *identityFlags) addIdentityFlag(value string) error {
+	*f = append(*f, identityFlag{Type: "i", Value: value})
+	return nil
+}
+
+func (f *identityFlags) addPluginFlag(value string) error {
+	*f = append(*f, identityFlag{Type: "j", Value: value})
+	return nil
+}
+
 func main() {
-	log.SetFlags(0)
 	flag.Usage = func() { fmt.Fprintf(os.Stderr, "%s\n", usage) }
 
 	if len(os.Args) == 1 {
 		flag.Usage()
-		os.Exit(1)
+		exit(1)
 	}
 
 	var (
 		outFlag                          string
 		decryptFlag, encryptFlag         bool
 		passFlag, versionFlag, armorFlag bool
-		recipientFlags, identityFlags    multiFlag
+		recipientFlags                   multiFlag
 		recipientsFileFlags              multiFlag
+		identityFlags                    identityFlags
 	)
 
 	flag.BoolVar(&versionFlag, "version", false, "print the version")
@@ -107,8 +131,9 @@ func main() {
 	flag.Var(&recipientFlags, "recipient", "recipient (can be repeated)")
 	flag.Var(&recipientsFileFlags, "R", "recipients file (can be repeated)")
 	flag.Var(&recipientsFileFlags, "recipients-file", "recipients file (can be repeated)")
-	flag.Var(&identityFlags, "i", "identity (can be repeated)")
-	flag.Var(&identityFlags, "identity", "identity (can be repeated)")
+	flag.Func("i", "identity (can be repeated)", identityFlags.addIdentityFlag)
+	flag.Func("identity", "identity (can be repeated)", identityFlags.addIdentityFlag)
+	flag.Func("j", "data-less plugin (can be repeated)", identityFlags.addPluginFlag)
 	flag.Parse()
 
 	if versionFlag {
@@ -117,6 +142,8 @@ func main() {
 			return
 		}
 		if buildInfo, ok := debug.ReadBuildInfo(); ok {
+			// TODO: use buildInfo.Settings to prepare a pseudoversion such as
+			// v0.0.0-20210817164053-32db794688a5+dirty on Go 1.18+.
 			fmt.Println(buildInfo.Main.Version)
 			return
 		}
@@ -125,9 +152,37 @@ func main() {
 	}
 
 	if flag.NArg() > 1 {
-		errorWithHint(fmt.Sprintf("too many arguments: %q", flag.Args()),
-			"note that the input file must be specified after all flags")
+		var hints []string
+		quotedArgs := strings.Trim(fmt.Sprintf("%q", flag.Args()), "[]")
+
+		// If the second argument looks like a flag, suggest moving the first
+		// argument to the back (as long as the arguments don't need quoting).
+		if strings.HasPrefix(flag.Arg(1), "-") {
+			hints = append(hints, "the input file must be specified after all flags")
+
+			safe := true
+			unsafeShell := regexp.MustCompile(`[^\w@%+=:,./-]`)
+			for _, arg := range os.Args {
+				if unsafeShell.MatchString(arg) {
+					safe = false
+					break
+				}
+			}
+			if safe {
+				i := len(os.Args) - flag.NArg()
+				newArgs := append([]string{}, os.Args[:i]...)
+				newArgs = append(newArgs, os.Args[i+1:]...)
+				newArgs = append(newArgs, os.Args[i])
+				hints = append(hints, "did you mean:")
+				hints = append(hints, "    "+strings.Join(newArgs, " "))
+			}
+		} else {
+			hints = append(hints, "only a single input file may be specified at a time")
+		}
+
+		errorWithHint("too many INPUT arguments: "+quotedArgs, hints...)
 	}
+
 	switch {
 	case decryptFlag:
 		if encryptFlag {
@@ -151,7 +206,7 @@ func main() {
 		}
 	default: // encrypt
 		if len(identityFlags) > 0 && !encryptFlag {
-			errorWithHint("-i/--identity can't be used in encryption mode unless symmetric encryption is explicitly selected with -e/--encrypt",
+			errorWithHint("-i/--identity and -j can't be used in encryption mode unless symmetric encryption is explicitly selected with -e/--encrypt",
 				"did you forget to specify -d/--decrypt?")
 		}
 		if len(recipientFlags)+len(recipientsFileFlags)+len(identityFlags) == 0 && !passFlag {
@@ -165,13 +220,25 @@ func main() {
 			errorf("-p/--passphrase can't be combined with -R/--recipients-file")
 		}
 		if len(identityFlags) > 0 && passFlag {
-			errorf("-p/--passphrase can't be combined with -i/--identity")
+			errorf("-p/--passphrase can't be combined with -i/--identity and -j")
 		}
+	}
+
+	var inUseFiles []string
+	for _, i := range identityFlags {
+		if i.Type != "i" {
+			continue
+		}
+		inUseFiles = append(inUseFiles, absPath(i.Value))
+	}
+	for _, f := range recipientsFileFlags {
+		inUseFiles = append(inUseFiles, absPath(f))
 	}
 
 	var in io.Reader = os.Stdin
 	var out io.Writer = os.Stdout
 	if name := flag.Arg(0); name != "" && name != "-" {
+		inUseFiles = append(inUseFiles, absPath(name))
 		f, err := os.Open(name)
 		if err != nil {
 			errorf("failed to open input file %q: %v", name, err)
@@ -180,8 +247,23 @@ func main() {
 		in = f
 	} else {
 		stdinInUse = true
+		if decryptFlag && term.IsTerminal(int(os.Stdin.Fd())) {
+			// If the input comes from a TTY, assume it's armored, and buffer up
+			// to the END line (or EOF/EOT) so that a password prompt or the
+			// output don't get in the way of typing the input. See Issue 364.
+			buf, err := bufferTerminalInput(in)
+			if err != nil {
+				errorf("failed to buffer terminal input: %v", err)
+			}
+			in = buf
+		}
 	}
 	if name := outFlag; name != "" && name != "-" {
+		for _, f := range inUseFiles {
+			if f == absPath(name) {
+				errorf("input and output file are the same: %q", name)
+			}
+		}
 		f := newLazyOpener(name)
 		defer func() {
 			if err := f.Close(); err != nil {
@@ -211,21 +293,19 @@ func main() {
 	}
 
 	switch {
+	case decryptFlag && len(identityFlags) == 0:
+		decryptPass(in, out)
 	case decryptFlag:
-		decrypt(identityFlags, in, out)
+		decryptNotPass(identityFlags, in, out)
 	case passFlag:
-		pass, err := passphrasePromptForEncryption()
-		if err != nil {
-			errorf("%v", err)
-		}
-		encryptPass(pass, in, out, armorFlag)
+		encryptPass(in, out, armorFlag)
 	default:
-		encryptKeys(recipientFlags, recipientsFileFlags, identityFlags, in, out, armorFlag)
+		encryptNotPass(recipientFlags, recipientsFileFlags, identityFlags, in, out, armorFlag)
 	}
 }
 
 func passphrasePromptForEncryption() (string, error) {
-	pass, err := readPassphrase("Enter passphrase (leave empty to autogenerate a secure one):")
+	pass, err := readSecret("Enter passphrase (leave empty to autogenerate a secure one):")
 	if err != nil {
 		return "", fmt.Errorf("could not read passphrase: %v", err)
 	}
@@ -236,10 +316,12 @@ func passphrasePromptForEncryption() (string, error) {
 			words = append(words, randomWord())
 		}
 		p = strings.Join(words, "-")
-		// TODO: consider printing this to the terminal, instead of stderr.
-		fmt.Fprintf(os.Stderr, "Using the autogenerated passphrase %q.\n", p)
+		err := printfToTerminal("using autogenerated passphrase %q", p)
+		if err != nil {
+			return "", fmt.Errorf("could not print passphrase: %v", err)
+		}
 	} else {
-		confirm, err := readPassphrase("Confirm passphrase:")
+		confirm, err := readSecret("Confirm passphrase:")
 		if err != nil {
 			return "", fmt.Errorf("could not read passphrase: %v", err)
 		}
@@ -250,9 +332,9 @@ func passphrasePromptForEncryption() (string, error) {
 	return p, nil
 }
 
-func encryptKeys(keys, files, identities []string, in io.Reader, out io.Writer, armor bool) {
+func encryptNotPass(recs, files []string, identities identityFlags, in io.Reader, out io.Writer, armor bool) {
 	var recipients []age.Recipient
-	for _, arg := range keys {
+	for _, arg := range recs {
 		r, err := parseRecipient(arg)
 		if err, ok := err.(gitHubRecipientError); ok {
 			errorWithHint(err.Error(), "instead, use recipient files like",
@@ -271,27 +353,44 @@ func encryptKeys(keys, files, identities []string, in io.Reader, out io.Writer, 
 		}
 		recipients = append(recipients, recs...)
 	}
-	for _, name := range identities {
-		ids, err := parseIdentitiesFile(name)
-		if err != nil {
-			errorf("reading %q: %v", name, err)
+	for _, f := range identities {
+		switch f.Type {
+		case "i":
+			ids, err := parseIdentitiesFile(f.Value)
+			if err != nil {
+				errorf("reading %q: %v", f.Value, err)
+			}
+			r, err := identitiesToRecipients(ids)
+			if err != nil {
+				errorf("internal error processing %q: %v", f.Value, err)
+			}
+			recipients = append(recipients, r...)
+		case "j":
+			id, err := plugin.NewIdentityWithoutData(f.Value, pluginTerminalUI)
+			if err != nil {
+				errorf("initializing %q: %v", f.Value, err)
+			}
+			recipients = append(recipients, id.Recipient())
 		}
-		r, err := identitiesToRecipients(ids)
-		if err != nil {
-			errorf("internal error processing %q: %v", name, err)
-		}
-		recipients = append(recipients, r...)
 	}
 	encrypt(recipients, in, out, armor)
 }
 
-func encryptPass(pass string, in io.Reader, out io.Writer, armor bool) {
+func encryptPass(in io.Reader, out io.Writer, armor bool) {
+	pass, err := passphrasePromptForEncryption()
+	if err != nil {
+		errorf("%v", err)
+	}
+
 	r, err := age.NewScryptRecipient(pass)
 	if err != nil {
 		errorf("%v", err)
 	}
+	testOnlyConfigureScryptIdentity(r)
 	encrypt([]age.Recipient{r}, in, out, armor)
 }
+
+var testOnlyConfigureScryptIdentity = func(*age.ScryptRecipient) {}
 
 func encrypt(recipients []age.Recipient, in io.Reader, out io.Writer, withArmor bool) {
 	if withArmor {
@@ -321,21 +420,51 @@ func encrypt(recipients []age.Recipient, in io.Reader, out io.Writer, withArmor 
 const crlfMangledIntro = "age-encryption.org/v1" + "\r"
 const utf16MangledIntro = "\xff\xfe" + "a\x00g\x00e\x00-\x00e\x00n\x00c\x00r\x00y\x00p\x00"
 
-func decrypt(keys []string, in io.Reader, out io.Writer) {
+type rejectScryptIdentity struct{}
+
+func (rejectScryptIdentity) Unwrap(stanzas []*age.Stanza) ([]byte, error) {
+	if len(stanzas) != 1 || stanzas[0].Type != "scrypt" {
+		return nil, age.ErrIncorrectIdentity
+	}
+	errorWithHint("file is passphrase-encrypted but identities were specified with -i/--identity or -j",
+		"remove all -i/--identity/-j flags to decrypt passphrase-encrypted files")
+	panic("unreachable")
+}
+
+func decryptNotPass(flags identityFlags, in io.Reader, out io.Writer) {
+	identities := []age.Identity{rejectScryptIdentity{}}
+
+	for _, f := range flags {
+		switch f.Type {
+		case "i":
+			ids, err := parseIdentitiesFile(f.Value)
+			if err != nil {
+				errorf("reading %q: %v", f.Value, err)
+			}
+			identities = append(identities, ids...)
+		case "j":
+			id, err := plugin.NewIdentityWithoutData(f.Value, pluginTerminalUI)
+			if err != nil {
+				errorf("initializing %q: %v", f.Value, err)
+			}
+			identities = append(identities, id)
+		}
+	}
+
+	decrypt(identities, in, out)
+}
+
+func decryptPass(in io.Reader, out io.Writer) {
 	identities := []age.Identity{
 		// If there is an scrypt recipient (it will have to be the only one and)
 		// this identity will be invoked.
-		&LazyScryptIdentity{passphrasePrompt},
+		&LazyScryptIdentity{passphrasePromptForDecryption},
 	}
 
-	for _, name := range keys {
-		ids, err := parseIdentitiesFile(name)
-		if err != nil {
-			errorf("reading %q: %v", name, err)
-		}
-		identities = append(identities, ids...)
-	}
+	decrypt(identities, in, out)
+}
 
+func decrypt(identities []age.Identity, in io.Reader, out io.Writer) {
 	rr := bufio.NewReader(in)
 	if intro, _ := rr.Peek(len(crlfMangledIntro)); string(intro) == crlfMangledIntro ||
 		string(intro) == utf16MangledIntro {
@@ -354,13 +483,14 @@ func decrypt(keys []string, in io.Reader, out io.Writer) {
 	if err != nil {
 		errorf("%v", err)
 	}
+	out.Write(nil) // trigger the lazyOpener even if r is empty
 	if _, err := io.Copy(out, r); err != nil {
 		errorf("%v", err)
 	}
 }
 
-func passphrasePrompt() (string, error) {
-	pass, err := readPassphrase("Enter passphrase:")
+func passphrasePromptForDecryption() (string, error) {
+	pass, err := readSecret("Enter passphrase:")
 	if err != nil {
 		return "", fmt.Errorf("could not read passphrase: %v", err)
 	}
@@ -372,6 +502,8 @@ func identitiesToRecipients(ids []age.Identity) ([]age.Recipient, error) {
 	for _, id := range ids {
 		switch id := id.(type) {
 		case *age.X25519Identity:
+			recipients = append(recipients, id.Recipient())
+		case *plugin.Identity:
 			recipients = append(recipients, id.Recipient())
 		case *agessh.RSAIdentity:
 			recipients = append(recipients, id.Recipient())
@@ -419,19 +551,9 @@ func (l *lazyOpener) Close() error {
 	return nil
 }
 
-func errorf(format string, v ...interface{}) {
-	log.Printf("age: error: "+format, v...)
-	log.Fatalf("age: report unexpected or unhelpful errors at https://filippo.io/age/report")
-}
-
-func warningf(format string, v ...interface{}) {
-	log.Printf("age: warning: "+format, v...)
-}
-
-func errorWithHint(error string, hints ...string) {
-	log.Printf("age: error: %s", error)
-	for _, hint := range hints {
-		log.Printf("age: hint: %s", hint)
+func absPath(name string) string {
+	if abs, err := filepath.Abs(name); err == nil {
+		return abs
 	}
-	log.Fatalf("age: report unexpected or unhelpful errors at https://filippo.io/age/report")
+	return name
 }
